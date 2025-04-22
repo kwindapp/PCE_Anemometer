@@ -60,8 +60,8 @@ void setup(void) {
   lora.getId(buffer, 256, 1);
   SerialUSB.print(buffer);
 
-  lora.setId(NULL, "6081F9EAE13C996E", "6081F9FF0127CE20");
-  lora.setKey(NULL, NULL, "F17522A10F4A5AD8C6B84590D1FBA7C3");
+  lora.setId(NULL, "6081F9EAE996E", "6081F927CE20");
+  lora.setKey(NULL, NULL, "F17522A10F4A5ADFBA7C3");
 
   lora.setDeciveMode(LWOTAA);
   lora.setDataRate(DR3, EU868);
