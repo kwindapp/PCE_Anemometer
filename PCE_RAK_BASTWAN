@@ -1,0 +1,213 @@
+#include <lorawan.h>
+
+// OTAA credentials
+const char *devEui = "6081F92A7604ED70";
+const char *appEui = "6081F9A18AEB66CB";
+const char *appKey = "113D3AA11E7EDCE47";
+
+// Interval settings
+const unsigned long interval = 60000;  // 1 minute
+unsigned long previousMillis = 0;
+
+// Anemometer pins and variables
+const byte interruptPin = 6; // Wind speed sensor input
+volatile unsigned long sTime = 0;
+volatile float pulseTime = 0;
+volatile float culPulseTime = 0;
+volatile unsigned int avgWindCount = 0;
+volatile bool start = true;
+volatile float minPulseTime = 1000000.0; // Start with a big value
+
+// Battery measurement
+const int batteryPin = A0;
+const float voltageDividerRatio = 2.0;
+const float referenceVoltage = 3.3;
+const float batteryThreshold = 3.5;
+
+// LoRaWAN
+char outStr[255];
+byte recvStatus = 0;
+byte payload[8]; // 4 values: wind speed, wind avg, wind max, battery voltage
+
+// Wind data
+float windSum = 0;
+float windAvg = 0;
+
+// BastWAN RFM95 pin setup
+const sRFM_pins RFM_pins = {
+  .CS = SS,
+  .RST = RFM_RST,
+  .DIO0 = RFM_DIO0,
+  .DIO1 = RFM_DIO1,
+  .DIO2 = RFM_DIO2,
+  .DIO5 = RFM_DIO5,
+};
+
+// ====================================
+
+void setup() {
+  Serial.begin(115200);
+  unsigned long timeout = millis();
+  while (!Serial && millis() - timeout < 3000);
+
+  pinMode(interruptPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(interruptPin), anemometerISR, RISING);
+
+  if (!lora.init()) {
+    Serial.println("RFM95 not detected");
+    delay(5000);
+    return;
+  }
+
+  delay(5000);
+
+  float batteryVoltage = readBatteryVoltage();
+  Serial.print("Battery voltage at start: ");
+  Serial.print(batteryVoltage, 2);
+  Serial.println(" V");
+
+  if (batteryVoltage < batteryThreshold) {
+    Serial.println("Battery too low for join, stopping.");
+    while (1);
+  }
+
+  lora.setDeviceClass(CLASS_A);
+  lora.setDataRate(SF8BW125);
+  lora.setChannel(MULTI);
+  lora.setDevEUI(devEui);
+  lora.setAppEUI(appEui);
+  lora.setAppKey(appKey);
+
+  while (!lora.join()) {
+    Serial.println("Joining...");
+    delay(10000);
+  }
+
+  Serial.println("Joined to network");
+}
+
+// ====================================
+
+void loop() {
+  static bool sendFlag = false;
+
+  if (millis() - previousMillis >= interval) {
+    previousMillis = millis();
+    sendFlag = true;
+  }
+
+  if (sendFlag) {
+    detachInterrupt(digitalPinToInterrupt(interruptPin));
+    calculateWindStats();
+    attachInterrupt(digitalPinToInterrupt(interruptPin), anemometerISR, RISING);
+    sendFlag = false;
+  }
+
+  recvStatus = lora.readData(outStr);
+  if (recvStatus) {
+    Serial.println(outStr);
+  }
+
+  lora.update();
+}
+
+// ====================================
+// Helper Functions
+
+float readBatteryVoltage() {
+  int raw = analogRead(batteryPin);
+  return (raw / 1023.0) * referenceVoltage * voltageDividerRatio;
+}
+
+// Anemometer ISR: Called every time the wind sensor triggers
+void anemometerISR() {
+  unsigned long cTime = millis();
+  if (!start) {
+    pulseTime = (float)(cTime - sTime) / 1000.0;
+    culPulseTime += pulseTime;
+    avgWindCount++;
+
+    if (pulseTime < minPulseTime) {
+      minPulseTime = pulseTime; // Save smallest pulse time for max wind
+    }
+  }
+  sTime = cTime;
+  start = false;
+}
+
+// Calculate the current, average and max wind speeds
+void calculateWindStats() {
+  unsigned long rTime = millis();
+  if ((rTime - sTime) > 2500) pulseTime = 0; // Wind stopped
+
+  float currentWSpeed = 0;
+  float avgWSpeed = 0;
+  float maxWSpeed = 0;
+
+  if (pulseTime > 0.0) {
+    float freq = getAnemometerFreq(pulseTime);
+    currentWSpeed = getWindMS(freq);
+  } else {
+    currentWSpeed = 0;
+  }
+
+  if (avgWindCount > 0) {
+    avgWSpeed = getWindMS(getAnemometerFreq(culPulseTime / avgWindCount));
+  } else {
+    avgWSpeed = 0;
+  }
+
+  if (minPulseTime < 1000000.0) {
+    maxWSpeed = getWindMS(getAnemometerFreq(minPulseTime));
+  } else {
+    maxWSpeed = 0;
+  }
+
+  float batteryVoltage = readBatteryVoltage();
+
+  uint16_t windSpeed_ms = (uint16_t)(currentWSpeed * 100);
+  uint16_t windAvg_ms = (uint16_t)(avgWSpeed * 100);
+  uint16_t windMax_ms = (uint16_t)(maxWSpeed * 100);
+  uint16_t battery_mV = (uint16_t)(batteryVoltage * 1000);
+
+  // Prepare the payload
+  payload[0] = highByte(windSpeed_ms);
+  payload[1] = lowByte(windSpeed_ms);
+  payload[2] = highByte(windAvg_ms);
+  payload[3] = lowByte(windAvg_ms);
+  payload[4] = highByte(windMax_ms);
+  payload[5] = lowByte(windMax_ms);
+  payload[6] = highByte(battery_mV);
+  payload[7] = lowByte(battery_mV);
+
+  // Send via LoRa
+  lora.sendUplink((char*)payload, sizeof(payload), 0, 1);
+
+  // Serial output
+  Serial.println("================================");
+  Serial.print("Wind Speed (current): "); Serial.print(currentWSpeed, 2); Serial.println(" m/s");
+  Serial.print("Wind Speed (average): "); Serial.print(avgWSpeed, 2); Serial.println(" m/s");
+  Serial.print("Wind Speed (maximum): "); Serial.print(maxWSpeed, 2); Serial.println(" m/s");
+  Serial.print("Battery Voltage: "); Serial.print(batteryVoltage, 2); Serial.println(" V");
+  Serial.println("================================");
+
+  // Reset accumulators
+  minPulseTime = 1000000.0;
+  culPulseTime = 0;
+  avgWindCount = 0;
+}
+
+// Convert pulse time to frequency
+float getAnemometerFreq(float pTime) {
+  return (1.0 / pTime);
+}
+
+// Wind speed in m/s from frequency (your formula!)
+float getWindKmh(float freq) {
+  return (freq - 3.0) / 0.8; // Reverse your formula
+}
+
+float getWindMS(float freq) {
+  float windKmh = getWindKmh(freq);
+  return windKmh * 0.277778; // Convert km/h to m/s
+}
